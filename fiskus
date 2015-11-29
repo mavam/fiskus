@@ -1,0 +1,222 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) 2015, Matthias Vallentin
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     1. Redistributions of source code must retain the above copyright
+#        notice, this list of conditions and the following disclaimer.
+#
+#     2. Redistributions in binary form must reproduce the above copyright
+#        notice, this list of conditions and the following disclaimer in the
+#        documentation and/or other materials provided with the distribution.
+#
+#     3. Neither the name of the copyright holder nor the names of its
+#        contributors may be used to endorse or promote products derived from
+#        this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+require 'date'
+require 'fileutils'
+require 'logger'
+require 'yaml'
+
+OUTPUT_DIR = "transactions"
+
+# Emulates the UNIX "which" utility.
+def which(cmd)
+  ENV['PATH'].split(File::PATH_SEPARATOR).each do |path|
+    exe = "#{path}/#{cmd}"
+    return exe if File.executable?(exe)
+  end
+  nil
+end
+
+# Helper module for OS introspection
+module OS
+  def OS.windows?
+    (/cygwin|mswin|mingw|bccwin|wince|emx/ =~ RUBY_PLATFORM) != nil
+  end
+
+  def OS.mac?
+   (/darwin/ =~ RUBY_PLATFORM) != nil
+  end
+
+  def OS.unix?
+    !OS.windows?
+  end
+
+  def OS.linux?
+    OS.unix? and not OS.mac?
+  end
+end
+
+# Retrieves the OS-specific download directory of the current user.
+def download_directory
+  if OS.mac?
+    "~/Downloads"
+  else
+    raise "unsupported OS"
+  end
+end
+
+# Downloads transactions via ynab-downloader.
+def ynab_download(login, password, id, bank, type, from = nil, to = nil)
+  cmd = ['ynab-downloader', bank, '--username', login, '--password', password]
+  cmd += ['--account_id', id.to_s, '--account_type', type]
+  cmd += ['--from_date', from.strftime('%m/%d/%Y')] if from
+  cmd += ['--to_date', to.strftime('%m/%d/%Y')] if to
+  $logger.debug(cmd * ' ')
+  system(*cmd)
+end
+
+# A bank account.
+class Account
+  attr_accessor :type, :id
+
+  def initialize(type = nil, id = nil)
+    @id = id
+    @type = case type
+            when /credit|cc/
+              :credit_card
+            when /checking/
+              :checkings
+            when /savings/
+              :savings
+            end
+  end
+end
+
+# A bank which has login credentials for retrieving transactions.
+class Bank
+  def initialize(login, password)
+    @login = login
+    @password = password
+    @accounts = []
+  end
+
+  def add(account)
+    @accounts << account
+  end
+
+  def fetch(from = nil, to = nil)
+    @accounts.each do |a|
+      begin
+        retrieve(a, from, to)
+      rescue RuntimeError => e
+        $logger.error(e)
+      end
+    end
+  end
+
+  def retrieve(account, from, to)
+    raise "missing implementation"
+  end
+end
+
+# The CHASE bank.
+class CHASE < Bank
+  def retrieve(account, from, to = nil)
+    to ||= Date.today
+    $logger.info("retrieving CHASE transactions for account" \
+                 " #{account.id}/#{account.type} (#{from} -> #{to})")
+    # If we have only one credit card at CHASE, ynab-downloader needs to
+    # download the transactions via 'singlecc' type and 'cc' otherwise
+    acc, qfx = case account.type
+               when :credit_card
+                 ccs = @accounts.select{|a| a.type == :credit_card}
+                 [ccs.size > 1 ? 'cc' : 'singlecc', "Activity.QFX"]
+               else
+                 ['checking', "JPMC.QFX"]
+               end
+    ynab_download(@login, @password, account.id, 'chase', acc, from, to)
+    data = File.join(File.expand_path(download_directory), qfx)
+    if not File.exists?(data)
+      raise RuntimeError, "no transactions available from #{from} to #{to}"
+    end
+    dst = File.join(OUTPUT_DIR, "chase-#{account.type}-#{account.id}.qfx")
+    $logger.debug("moving #{data} -> #{dst}")
+    FileUtils.mkdir_p(OUTPUT_DIR) if not Dir.exists?(OUTPUT_DIR)
+    FileUtils.mv(data, dst)
+  end
+end
+
+# The download engine fetching transactions according to a given config file.
+class Fiskus
+  def initialize(config)
+    @banks = {}
+    config['accounts'].each do |account|
+      bank = account['bank']
+      case account['bank']
+      when /chase/i
+        b = bank.to_sym
+        if not @banks.include?(b)
+          creds = config['credentials'].find{|i| i['bank'] == bank}
+          raise "no credentials for bank #{bank}" unless creds
+          @banks[b] = CHASE.new(creds['login'], creds['password'])
+        end
+        @banks[b].add(Account.new(account['type'], account['id']))
+      else
+        raise "bank not supported: #{account['bank']}"
+      end
+    end
+  end
+
+  # Starts downloading transactions.
+  def fetch(from = nil, to = nil)
+    @banks.each_value {|bank| bank.fetch(from, to)}
+  end
+end
+
+if __FILE__ == $0
+  $logger = Logger.new(STDERR)
+  $logger.formatter = proc do |severity, datetime, progname, msg|
+      time = datetime.strftime('%Y-%m-%d %H:%M:%S')
+      "[#{time}] #{severity}#{' ' * (5 - severity.size + 1)} #{msg}\n"
+  end
+  # TODO: move this check to the bank-specific implementation where it is
+  # needed.
+  if not which('ynab-downloader')
+    $logger.error('could not find ynab-downloader in $PATH')
+    exit 1
+  end
+  if not (ARGV.size() == 1 || ARGV.size() == 2)
+    STDERR.puts "usage: #{$0} <config> [cache]"
+    exit 1
+  end
+  file = File.absolute_path(ARGV[0])
+  config = YAML.load_file(file)
+  # Check whether we stored the last run in the cache.
+  last_run = nil
+  cache = ARGV[1] if ARGV.size() > 1
+  if cache
+    contents = YAML.load_file(ARGV[1])
+    last_run = Date.parse(contents['last-run'])
+    $logger.info("found cache file with last run: #{last_run}")
+  end
+  # Get transactions.
+  fiskus = Fiskus.new(config)
+  $logger.debug('starting ofxing')
+  fiskus.fetch(last_run)
+  # Update cache.
+  if cache
+    today = Date.today.strftime('%Y/%m/%d')
+    $logger.info("updating cache to #{today}")
+    File.open(cache, 'w') { |file| file.write({'last-run' => today}.to_yaml) }
+  end
+  $logger.debug('completed ofxing')
+end

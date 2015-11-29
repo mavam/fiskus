@@ -1,0 +1,15 @@
+credentials:
+  - bank: CHASE
+    login: sweeny
+    password: todd
+
+accounts:
+  - type: cc
+    bank: CHASE
+    id: 777777777
+  - type: checkings
+    bank: CHASE
+    id: 777777777
+  - type: savings
+    bank: CHASE
+    id: 777777777
